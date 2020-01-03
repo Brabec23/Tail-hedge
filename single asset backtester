@@ -1,0 +1,193 @@
+
+library(lubridate)
+library(tidyverse)
+
+
+
+
+close <- function(x, value, tol=NULL, n=1){
+  if(!is.null(tol)){
+    y <- x[abs(x-value) <= tol]
+    y <- y[order(abs(y-value))]
+    head(y, n)
+  } else {
+    y <- x[order(abs(x-value))]
+    head(y, n)
+  }
+}
+
+
+
+
+
+#TRADING FUNCTIONS
+
+selloption <- function(option, current_date){
+  optionsellprice <<- filter(option, DataDate == current_date)["Bid"] %>% as.numeric()
+  portfoliotable$sellprices[time_period == current_date] <<- optionsellprice
+}
+
+
+
+
+chooseoption <- function(dataO, current_date, Required_moneyness = 0.75){
+  option_set <- dataO %>% filter(Type == "put", DataDate == current_date)
+  date_diff <- close(as.numeric(option_set$Expiration) - as.numeric(current_date), value = maturity_interval, n = 5)
+  option_set <- option_set %>% filter(((Expiration-current_date) >= min(date_diff) & ((Expiration-current_date) <= max(date_diff))))
+  
+  currentoption <<- option_set %>% slice(which.min(abs(moneyness - Required_moneyness)))
+  
+  option <<- dataO %>% filter(OptionSymbol == currentoption$OptionSymbol)
+  
+  current_symbol <- currentoption$OptionSymbol %>% as.character()
+}
+
+
+
+
+buyoption <- function(option, current_date){
+  optionpurchaseprice <<- currentoption$Ask
+  portfoliotable$buyprices[time_period == current_date] <<- optionpurchaseprice
+  last_purchase_date <<- current_date
+}
+
+
+#MONETIZATION TESTS
+
+
+mone_growth_rule_test <- function(option, mone_growth_rule, optionpurchaseprice){
+  return(filter(option, DataDate == current_date)["Bid"] %>% as.numeric() > mone_growth_rule * optionpurchaseprice)
+}  
+
+mone_time_rule_test <- function(last_purchase_date, current_date, mone_time_rule){
+  return(interval(last_purchase_date, current_date) > mone_time_rule)
+}  
+
+mone_time_and_rule_test <- function(option, current_date, mone_growth_rule, mone_time_rule, last_purchase_date, optionpurchaseprice){
+  return(((filter(option, DataDate == current_date)["Bid"] %>% as.numeric() > mone_growth_rule * optionpurchaseprice) > mone_growth_rule * optionpurchaseprice) |
+           ((current_date - last_purchase_date) > mone_time_rule))
+}  
+
+
+
+
+
+
+#research period
+time_period <- unique(dataO$DataDate)
+start_date <- dataO$DataDate[1]
+
+Required_moneyness <- 0.75
+
+
+#Choosing monetizing criteria
+criteria <- 3
+
+
+
+#fixed variables 
+mone_time_rule <- 6
+mone_growth_rule <- 3
+maturity_interval <- 60
+
+#trading days and prices
+tradedates <- rep(NA, length(time_period))
+sellprices <- rep(0, length(time_period))
+buyprices <- rep(0, length(time_period))
+ret <- rep(0, length(time_period))
+
+#prices of the option portfolio
+hedge_portfolio_ret <- rep(NA, length(time_period))
+
+#time series table of the option portfolio
+portfoliotable <-  data.frame(time_period, hedge_portfolio_ret, tradedates, sellprices, buyprices)
+
+
+
+
+
+
+
+
+
+
+# varying variables
+current_date <- start_date
+last_purchase_date <- start_date
+optionpurchaseprice <- NA
+optionsellprice <- NA
+option <- NULL
+
+
+
+# Main
+chooseoption(dataO, current_date, Required_moneyness = Required_moneyness)
+buyoption(option = option, current_date = current_date)
+portfoliotable$hedge_portfolio_ret[time_period == current_date] <- 0
+portfoliotable$tradedates[time_period == current_date] <- "Yes"
+
+
+option <- rownames_to_column(option)
+option$rowname <- as.numeric(option$rowname)
+
+
+
+
+for (i in 2:length(portfoliotable$time_period)){
+  
+  
+  current_date <- portfoliotable$time_period[i]
+
+    
+    portfoliotable$hedge_portfolio_ret[time_period == current_date] <- log(option$Last[option$DataDate == current_date]) - log(optionlag$Last)
+    
+    
+    portfoliotable$tradedates[time_period == current_date] <- "No"
+  
+  
+
+
+
+  if (criteria == 1){
+    test_rule <- mone_growth_rule_test(option = option, mone_growth_rule = mone_growth_rule, optionpurchaseprice = optionpurchaseprice)
+  } else if (criteria == 2){
+    test_rule <- mone_time_rule_test(last_purchase_date = last_purchase_date, current_date = current_date, mone_time_rule = mone_time_rule)
+  } else {
+    test_rule <-  mone_time_and_rule_test(option = option, current_date = current_date, mone_growth_rule = mone_growth_rule,
+                                          mone_time_rule = mone_time_rule, last_purchase_date = last_purchase_date, optionpurchaseprice = optionpurchaseprice)
+  }
+  
+  if (test_rule == TRUE){
+    
+    
+    portfoliotable$tradedates[time_period == current_date] <- "Yes"   
+    
+    #Monetization
+    selloption(option = option, current_date = current_date)
+    
+    portfoliotable$hedge_portfolio_ret[time_period == current_date] <- log(optionsellprice) - log(optionlag$Last)
+    
+    
+    #The current option changes
+    chooseoption(dataO = dataO, Required_moneyness = Required_moneyness, current_date = current_date)
+    buyoption(option = option, current_date = current_date)
+    #
+    rownames(option)
+    option <- rownames_to_column(option)
+    rownumber <- option[option$DataDate == current_date, 1] %>% as.numeric() - 1
+    optionlag <- option %>% filter(rowname == rownumber)
+    
+  }
+}
+
+
+#replacing missing values
+portfoliotable$hedge_portfolio_ret[is.na(portfoliotable$hedge_portfolio_ret)] <- -Inf
+portfoliotable$sellprices[is.na(portfoliotable$sellprices)] <- 0
+portfoliotable$hedge_portfolio_ret[is.infinite(portfoliotable$hedge_portfolio_ret) & portfoliotable$hedge_portfolio_ret > 0] <- 0
+
+
+
+View(portfoliotable)
+
+
