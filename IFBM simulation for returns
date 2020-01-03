@@ -1,0 +1,111 @@
+
+library(reshape2)
+library(tidyr)
+library(ggplot2)
+library(dplyr)
+library(MASS)
+library(sde)
+library(PerformanceAnalytics)
+library(Sim.DiffProc)
+
+# Irrational fractional brownian motion
+IFBM <- function(x = 1, r = 0, sigma = 1, T = 1, N = 100, K = -19.76, c = 0.44){
+  B <- BM(T = T , N = N)
+  AF <- (2 * exp(-c * ((as.numeric(B)^2)/2))-1) * atan(as.numeric(B))
+  S <- x * exp((r - sigma^2/2) * time(B) + sigma * as.numeric(B) + (r - sigma^2/2) * K * AF * time(B))
+  X <- ts(S, start = 0, deltat = deltat(B))
+  return(X)
+  
+}
+
+
+
+#Parameters
+mu=0.05; sigma=0.2; P0=100; T = 1 
+nt=100; n=250
+
+
+
+##GBM simulation
+dt=T/n; t=seq(0,T,by=dt)
+W=matrix(rep(0,length(t)*nt), nrow=nt)
+for (i in 1:nt) {W[i,]= GBM(x=P0,r=mu,sigma=sigma,T=T,N=n)}
+
+
+#IFBM simulation
+dt=T/n; t=seq(0,T,by=dt)
+X=matrix(rep(0,length(t)*nt), nrow=nt)
+for (i in 1:nt) {X[i,]= IFBM(x=P0,r=mu,sigma=sigma,T=T,N=n)}
+
+
+
+
+log_ret_W <- apply(W, 1, FUN = log) %>% diff()
+max_drop_GBM <- apply(log_ret_W, 2, FUN = maxDrawdown) %>% which.max()       #index of the worst path in the simulation
+
+W[max_drop_GBM, ]                                                            ## the worst path measured by maximum drawdown
+plot(W[max_drop_GBM, ], type ="l")                                           ### plot of the worst path    
+
+
+
+
+
+log_ret_X <- apply(X, 1, FUN = log) %>% diff()
+max_drop_IFBM <- apply(log_ret_X, 2, FUN = maxDrawdown) %>% which.max()      #index of the worst path in the simulation
+
+X[max_drop_IFBM, ]                                                           ## the worst path measured by maximum drawdown
+plot(X[max_drop_IFBM, ], type = "l")                                         ### plot of the worst path 
+
+
+
+
+
+
+
+
+
+
+
+# Creating time-series plots
+
+time <- ts(seq(0, 250, 1))  
+
+df1 <- data.frame(X)
+df1 <- t(df1)
+df1 <- data.frame(df1, time)
+df1 <- dplyr :: select(df1, time, everything())
+
+
+
+
+df2 <- data.frame(W)
+df2 <- t(df2)
+df2 <- data.frame(df2, time)
+rownames(df2) <- NULL
+df2 <- dplyr :: select(df2, time, everything())
+
+#View(df2)
+#View(df1)
+  
+
+
+
+
+df1 <- melt(df1 ,  id.vars = 'time', variable.name = 'key')
+df2 <- melt(df2 ,  id.vars = 'time', variable.name = 'key')
+
+
+
+
+ggplot(df2, aes(x = time, y = value, colour = key)) + 
+  ylim(0, 300) +
+  geom_line() +
+  theme(legend.position = "none")
+   
+ 
+ggplot(df1, aes(x = time, y = value, colour = key)) + 
+  ylim(0, 300) +
+  geom_line()  +
+  theme(legend.position = "none")
+
+
