@@ -1,0 +1,480 @@
+
+
+# downloading underlying price
+download_underlying <- function(ticker){
+  S0 <- NULL
+  # Uses Yahoo download 
+  try(S0 <- coredata(getSymbols(ticker, from = today(), auto.assign = FALSE)[,6]) %>% as.numeric(), silent = TRUE)
+  i <- 0
+  while (is.null(S0)){
+    i <-  i+1
+    try(S0 <- coredata(getSymbols(ticker, from = today() %m-% days(i), auto.assign = FALSE)[,6]) %>% as.numeric(), silent = TRUE)
+    if (i>20){
+      cat(paste(ticker,"price is not found"))
+      break()
+    }
+  }
+  i <- NULL
+  S0 <- S0[length(S0)] # price of underlying
+  return(S0 = S0)
+}  
+
+
+# downloading option data
+download_options <- function(ticker, price){
+  tryCatch({opts <- getOptionChain(ticker, expiration)},  # Option data
+           error = function(e){print(paste("Options on",ticker, "asset and chosen time period currently not available from Yahoo"))})
+  
+  # option symbols as the first column 
+  rowtocol <- partial(rownames_to_column, var="Symbol")
+  possible_rownames_to_column <- possibly(rowtocol, otherwise = NULL)
+  opts %<>% map(~ .x %>% map(possible_rownames_to_column))
+  
+  data_by_exp <- NULL
+  for (i in 1:length(opts)){
+    data <- NULL
+    for (k in 1:2){
+      data <- bind_rows(data, bind_cols(opts[[i]][k], type = rep(names(opts[[i]][k]), nrow(as.data.frame(opts[[i]][k])))))
+    }
+    # Option data by expiry dates
+    data_by_exp <- append(data_by_exp, list(bind_cols(data, date = rep(names(opts[i]), nrow(as.data.frame(opts[[i]][1])) + nrow(as.data.frame(opts[[i]][2]))))))
+  }
+  
+  # all puts with Ask price
+  opt_data <- bind_rows(data_by_exp)
+  return(list(opt_data = opt_data, data_by_exp = data_by_exp))
+}  
+
+
+
+
+
+# Downloads options and the current price of underlying and returns a list of 2. 1) all usable put options 2)ATM put options
+filter_options <- function(ticker, price, opt_data = NULL, underlyingprice = NULL){
+ 
+  # whether the underlying is offered manually or not
+  if (is.null(underlyingprice)){
+    S0 <- download_underlying(ticker = ticker)
+  } else {
+    S0 <- underlyingprice
+  }
+  
+  # whether the option data is offered manually or not
+  if (is.null(opt_data)){
+    y <- download_options(ticker = ticker, price = price)
+    opt_data <- y$opt_data
+    data_by_exp <- y$data_by_exp
+  } else {
+    opt_data <- as.data.frame(opt_data$opt_data)
+    data_by_exp <- split(opt_data, opt_data$date) 
+  }
+  
+  
+  wholedata <- opt_data
+  opt_data %<>% mutate(moneyness = Strike / S0, date = as.Date(opt_data$date, "%b.%d.%Y")) %>% filter(type == "puts", .[[price]] > 0, Vol > 0)
+  # atm options
+  atm_options <- map(data_by_exp, function(x) filter(x,type == "puts") %>% slice(which.min(abs(x$Strike - S0))))
+  atm_options %<>% bind_rows() %>% filter(.[[price]] > 0)  # this condition may find the best moneyness so that the are Ask prices available for these options 
+  atm_options %<>% mutate(date = as.Date(atm_options$date, "%b.%d.%Y"))
+  return(list(atm_options = atm_options, options = opt_data, spot = S0, whole_data = wholedata))
+}
+
+
+
+
+
+
+
+# Summarizes computed hedge prices and pareto valuation
+summarize_hedge_prices <- function(hedge_result, hedge_pareto_pricing){
+  Conclusion <- data.frame(c(as.numeric(hedge_result$Direct_hedge_price), as.numeric(hedge_pareto_pricing[[1]][5])),
+                           c(as.numeric(hedge_result$Indirect_hedge_price), as.numeric(hedge_pareto_pricing[[2]][5])))
+  colnames(Conclusion) <- c(paste0(names(hedge_pareto_pricing[1])), paste0(names(hedge_pareto_pricing[2])))
+  rownames(Conclusion) <- c("Hedge price", "Pareto undervaluation")
+  return(Conclusion)
+}
+
+
+
+# compares direct and indirect hedge options pareto pricing
+compute_hedge_pareto_prices <- function(hedge_result){
+  
+  
+  hedge_pareto_pricing <- vector(mode = "list", length = 2)
+  hedge_dates <- c(hedge_result$Direct_hedge_date, hedge_result$Indirect_hedge_date)
+  hedge_strikes <- c(hedge_result$directStrike, hedge_result$indirectStrike)
+  option_symbols <- c(hedge_result$Direct_symbol, hedge_result$Indirect_symbol)
+  spots <- c(hedge_result$Direct_spot, hedge_result$Indirect_spot)
+  opt_input <- vector(mode = "list", length = 2)
+  opt_input <- list(hedge_result$Direct_whole_options, hedge_result$Indirect_whole_options)
+  
+  for (i in 1:2){
+    hedge_pareto_pricing[[i]] <- test_pareto_pricing(ticker = tickers[i], Alpha = Alpha,
+                                                     type = type, date_pick = hedge_dates[i],
+                                                     expiration = expiration, hedge_strike = hedge_strikes[i],
+                                                     opt_pare_input = opt_input[[i]], spot_input = spots[i])
+    names(hedge_pareto_pricing)[[i]] <- paste(tickers[i], "option")
+  }
+  return(hedge_pareto_pricing)
+}
+
+
+
+
+
+
+
+
+
+
+
+# Sets pareto valuations on hedge options
+test_pareto_pricing <- function(ticker, date_pick, expiration, hedge_strike, Alpha = 2, type = "put", opt_pare_input = NULL, spot_input = NULL){
+  
+  if (is.null(opt_pare_input)){
+    opt_data <-  download_options()[1]
+    #opt_data %<>% mutate(date = as.Date(opt_data$date, "%b.%d.%Y"))
+    opt_data <- opt_data %>% mutate(date = as.Date(opt_data$date, "%b.%d.%Y"))
+    
+    
+    
+    
+  } else {
+    opt_data <- opt_pare_input %>% mutate(date = as.Date(opt_pare_input$date, "%b.%d.%Y"))
+  }
+  
+  
+  
+  
+  
+  if (is.null(spot_input)){
+    S0 <- NULL
+    try(S0 <- coredata(getSymbols(ticker, from = today(), auto.assign = FALSE)[,6]) %>% as.numeric(), silent = TRUE)
+    i <- 1
+    while (is.null(S0)){
+      i <-  i+1
+      try(S0 <- coredata(getSymbols(ticker, from = today() %m-% days(i), auto.assign = FALSE)[,6]) %>% as.numeric(), silent = TRUE)# Data of the underlying
+    }
+    i <- NULL
+    S0 <- S0[length(S0)]
+    
+  } else{
+    S0 <- spot_input
+  }
+  
+  
+  
+  
+  
+  
+  #anchor_option_price for computing the karamata constant
+  Kcm <- opt_data %>% filter(date == date_pick, type == "calls", .[[price]] > 0) %>% # fix filtering the date_pick to slicing the closest date available
+    filter(Strike > S0) %>% slice_(1) %>%
+    select(Strike, UQ(as.symbol(price))) %>% as.numeric()
+  if (is.na(Kcm[2])){stop(paste("Not Ask price available on",ticker))}
+  # computing karamata
+  test <- TRUE
+  K <- Kcm[1]
+  Cm <- Kcm[2]
+  l <- compute_karamata(alpha = Alpha, CM = Cm, K = K, S0 = S0) %>% as.numeric()
+  
+  while(K < ((1+l)*S0) | test){
+    K=K+0.5
+    Cm <- opt_data %>% filter(date == date_pick, type == "calls") %>%
+      filter(Strike == K) %>%
+      select(UQ(as.symbol(price))) %>% as.numeric()
+    
+    if(!is.numeric(Cm)|is.na(Cm)){
+      test <- TRUE
+    } else {
+      test <- FALSE
+      l <- compute_karamata(alpha = Alpha, CM = Cm, K = K, S0 = S0) %>% as.numeric()
+    }
+  }  
+  
+  #compute the starting point of the valid options    
+  if (type == "call"){
+    ck1 <- opt_data %>% filter(date == date_pick, type == "calls", Strike == K) # for call option
+  } else if (type =="put") {
+    while(K > ((1-l)*S0) | test){
+      K=K-1
+      Cm <- opt_data %>% filter(date == date_pick, type == "puts") %>%
+        filter(Strike == K) %>% select(UQ(as.symbol(price))) %>% as.numeric()
+      if(!is.numeric(Cm)|is.na(Cm)){
+        test <- TRUE
+      } else {
+        test <- FALSE
+      }
+    }
+    ck1 <- opt_data %>% filter(date == date_pick, type == "puts", Strike == K) # for put option
+  }
+  
+  #options whose prices are evaluated (strikes beyond karamata constant)
+  estimates <-  NULL
+  if (type == "call"){
+    testable_set <- opt_data %>% filter(date == date_pick, type == "calls", .[[price]] > 0,  Strike > as.numeric(ck1["Strike"]), Vol > 0) %>%
+      select(Strike, UQ(as.symbol(price)))
+    for (i in 1:nrow(testable_set)){
+      estimates[i] <- compute_pareto_call(K2 = testable_set$Strike[i], K1 = K, S0 = S0, alpha = Alpha, l = l, CK1 = ck1[[price]])
+    }
+  } else if (type == "put"){
+    testable_set <- opt_data %>% filter(date == date_pick, type == "puts", .[[price]] > 0,  Strike < as.numeric(ck1["Strike"]), Vol > 0) %>%
+      select(Strike, UQ(as.symbol(price)))
+    for (i in 1:nrow(testable_set)){
+      estimates[i] <- compute_pareto_put(K2 = testable_set$Strike[i], K1 = K, S0 = S0, alpha = Alpha, l = l, PK1 = ck1[[price]])
+    }
+  }
+  
+  #results
+  testable_set$estimates <- unlist(estimates)
+  testable_set$underpricing <- testable_set$estimates - testable_set[[price]]
+  testable_set$underpricing_precent <- round(((testable_set$underpricing / testable_set$estimates) * 100), 1)
+  
+  return(testable_set %>% filter(Strike == hedge_strike))
+  
+}
+
+
+
+
+
+
+
+
+
+
+
+
+# Chooses direct and indirect options for hedging
+choose_hedge_options <- function(tickers, expiration, rf, Required_moneyness = 0.75,
+                                 option_input = NULL, underlying_input = NULL, target_ttm = 2, price, corr, vol1, vol2){
+  
+  # beta 
+  beta <- compute_beta(underl_vola_direct = vol1, underl_vola_indirect = vol2, correlation = corr)
+  
+  
+  options <- vector(mode = "list", length = length(tickers))
+  all_options <- vector(mode = "list", length = length(tickers))
+  atm_options <- vector(mode = "list", length = length(tickers))
+  atm_option <- vector(mode = "list", length = length(tickers))
+  whole_data <- vector(mode = "list", length = length(tickers))
+  
+  
+  
+  
+  
+  # if we have preloaded optiondata we use it
+  
+  
+  for (i in 1:length(tickers)){
+    if (is.null(option_input[[i]]) | is.null(underlying_input[[i]])){
+      opt_filt <- partial(filter_options, ticker = tickers[i], price = price) 
+      
+    } else if (is.null(option_input[[i]]) | !is.null(underlying_input[[i]])){
+      opt_filt <- partial(filter_options, ticker = tickers[i], price = price, underlyingprice = underlying_input[[i]])
+      
+    } else if (!is.null(option_input[[i]]) | is.null(underlying_input[[i]])){
+      opt_filt <- partial(filter_options, ticker = tickers[i], price = price, opt_data = option_input[[i]])
+      
+    } else {
+      opt_filt <- partial(filter_options, ticker = tickers[i], price = price, opt_data = option_input[[i]], underlyingprice = underlying_input[[i]])
+    }
+    
+    
+    
+    
+    # downloading options and the current price of underlying from Yahoo
+    options[[i]] <- opt_filt() %>% as.list()
+    all_options[[i]] <- options[[i]]$options
+    atm_options[[i]] <- options[[i]]$atm_options
+    whole_data[[i]] <- options[[i]]$whole_data
+    if (nrow(atm_options[[i]]) == 0){stop(paste("No Ask price available on suitable",tickers[i],"option"))}
+    
+    
+    # when using one ATM option for ATM volatility calculation 
+    atm_option[[i]] <- atm_options[[i]] %>% slice(which.min(abs(as.numeric((today() %m+% months(target_ttm)) - date)))) # time requirement may bias strike so some average method may be better
+    
+    if (i == 1){ # (so if we have the direct option in question)
+      #filtering out the direct option which has the correct maturity and the correct moneyness
+      option <- choose_target_option(options = all_options[[i]], Required_moneyness = Required_moneyness, target_ttm = target_ttm)
+    }
+  }
+  
+  
+  # Direct spot (S0) and indirect spot (S1)
+  S0 <- options[[1]]$spot
+  S1 <- options[[2]]$spot
+  
+  # implied volatility from BS formula
+  atm_vola_direct <- derivmkts::bsputimpvol(s = S0, k = atm_option[[1]]$Strike, r = rf,
+                                            tt = as.numeric(atm_option[[1]]$date - today()) / 365,  d = 0, price = atm_option[[1]][[price]])  
+  atm_vola_indirect <- derivmkts::bsputimpvol(s = S1, k = atm_option[[2]]$Strike, r = rf,
+                                              tt = as.numeric(atm_option[[2]]$date - today()) / 365,  d = 0, price = atm_option[[2]][[price]])  
+  # strike of indirect
+  K2 <- compute_strike_indirect(strike_direct = option$Strike, spot_direct = S0, spot_indirect = S1, beta = beta) # K2 needed basically only for choosing the  indirect option to buy. Not for ATM impl vol calculations.
+  
+  # ATM volatility ratio
+  gamma <- compute_gamma(atm_vola_direct, atm_vola_indirect)
+  
+  # weight of the indirect hedge compared to the direct hedge
+  indirect_weight <- compute_weight_indirect(gamma = gamma, strike_direct = atm_option[[1]]$Strike, spot_direct = S0, beta = beta)
+  
+  
+  # match the expiration date and optimize the strike price 
+  indirect_option <- all_options[[2]] %>% mutate(diff = as.numeric(abs(date  - option$date))) %>% filter(diff == min(diff))
+  indirect_option %<>% slice(which.min(abs(K2 - Strike)))
+  strike_diff <- paste("The difference between available and target strike =", (abs(indirect_option$Strike - K2) / K2) * 100, "%")
+  date_diff <- paste("The difference between available and target date =", as.numeric(min(abs(indirect_option$date - option$date))), "days")
+  
+  
+  # total price of the indirect hedge
+  indirect_hedge_price <- indirect_option[[price]] * indirect_weight
+  # total price of the direct hedge
+  option[[price]]
+  
+  return(list(Direct_hedge_price = option[[price]], Indirect_hedge_price = indirect_hedge_price,
+              Direct_option_price = option[[price]], Indirect_option_price = indirect_option[[price]],
+              Direct_hedge_date = option$date, Indirect_hedge_date = indirect_option$date,
+              Strike_diff = strike_diff, Date_diff = date_diff,
+              directStrike = option$Strike, indirectStrike = indirect_option$Strike,
+              Direct_spot = S0, Indirect_spot = S1, 
+              Direct_symbol = option$Symbol, Indirect_symbol = indirect_option$Symbol,
+              Direct_options = all_options[[1]], Indirect_options = all_options[[2]],
+              Direct_whole_options = whole_data[[1]], Indirect_whole_options = whole_data[[2]]))
+  
+}
+
+
+
+
+
+
+
+
+
+
+#karamata constant
+compute_karamata <- function(alpha, CM, K, S0){
+  return(((alpha - 1)^(1 / alpha) * (CM)^(1 / alpha) * (K - S0)^(1 - (1 / alpha))) / S0)
+}
+
+
+# Price of call option
+compute_pareto_call <- function(K2, K1, S0, alpha, l, CK1){
+  if (K1 > ((1+l) * S0) & K2 > ((1+l) * S0)){
+    CK2 <- (((K2 - S0) / (K1 - S0))^(1 - alpha)) * CK1
+  } else {
+    cat("Doesnt apply on these strikes")}
+  return(CK2)
+}
+
+
+# Price of put option
+compute_pareto_put <- function(K2, K1, S0, alpha, l, PK1){
+  PK2 <- PK1 * ((-1)^(1 - alpha) * S0^(-alpha) * ((alpha - 1)*K2 + S0) - (K2 - S0)^(1 - alpha)) / 
+    ((-1)^(1 - alpha) * S0^-alpha * ((alpha - 1)*K1 + S0) - (K1 - S0)^(1 - alpha))
+  return(PK2)
+}
+
+
+
+
+compute_strike_indirect <- function(strike_direct, spot_direct, spot_indirect, beta){
+  return(spot_indirect * exp(beta * log(strike_direct / spot_direct)))
+} 
+
+
+compute_gamma <- function(atm_vola_indirect, atm_vola_direct){
+  return(atm_vola_indirect / atm_vola_direct)
+}
+
+
+compute_beta <- function(underl_vola_direct, underl_vola_indirect, correlation){
+  return((underl_vola_indirect / underl_vola_direct) * correlation)
+}
+
+
+#approximation
+compute_weight_indirect <- function(gamma, strike_direct, spot_direct, beta){
+  return((1 / gamma) * exp(-beta * log(strike_direct / spot_direct))) 
+}
+
+
+
+
+
+
+
+
+
+#filtering out the option which has the correct maturity and the correct moneyness
+#checks day by day from today to the last available option date to find the closest date for the target time to maturity (target_ttm)
+choose_target_option <- function(options, Required_moneyness, target_ttm = 2){
+  x <- today() %m+% months(target_ttm)
+  y <- data.frame()
+  daydiff <- as.numeric(max(options$date) - today(), units = "days")
+  for (i in 1: daydiff){
+    x <- x %m+% days(1)
+    y <- options %>% filter(date == x, moneyness < Required_moneyness)
+    if (nrow(y) > 0){break}
+  }
+  if (nrow(y) == 0){cat("Suitable moneyness level was not found")}
+  option <- options %>% filter(date == x) %>%
+    slice(which.min(abs(moneyness - Required_moneyness)))
+  return(option)
+  
+}
+
+
+
+
+
+
+# Remove the latest row from portfoliotable
+remove_latest_row <- function(portfoliotable){
+  portfoliotable <- portfoliotable[-nrow(portfoliotable), ]
+  return(portfoliotable)
+}
+
+
+#Monetization test tests whether our monetization conditions have been met or not
+monetize <- function(optionprice, optionpurchaseprice, last_purchase_date, mone_time_rule, mone_growth_rule, current_date){
+  return(optionprice > mone_growth_rule * optionpurchaseprice |
+           interval(current_date, last_purchase_date) > mone_time_rule)
+}
+
+
+
+# a function that extracts underlying parameters and option parameters of the chosen asset
+choose_option_asset <- function(optionpick, hedge_result){
+  if (optionpick == asset1){
+    optionsymbol <- c(hedge_result$Direct_symbol, hedge_result$Indirect_symbol)[1]
+    ticker_daily <- asset1
+    optionpurchaseprice <- hedge_result$Direct_option_price
+    spot <- hedge_result$Direct_spot
+  } else if (optionpick == asset2){
+    optionsymbol <- c(hedge_result$Direct_symbol, hedge_result$Indirect_symbol)[2]
+    ticker_daily <- asset2
+    optionpurchaseprice <- hedge_result$Indirect_option_price
+    spot <- hedge_result$Indirect_spot
+  } else {
+    cat("Choose the option asset as asset1 or asset2")
+  }
+  return(list(optionsymbol = optionsymbol, ticker_daily = ticker_daily, optionpurchaseprice = optionpurchaseprice, spot = spot))
+}
+
+
+
+
+# creates a new day to the portfoliotable
+create_newrow <- function(date=today(), asset_bought = NA, option_price = NA, option_return=NA, tradedates=0,  sellprice=NA, buyprices = NA,
+                          underlying_spot = NA, indexportfolio_price = NA, underlying_return = NA, hedgeportfolio_price = NA, portfolio_price = NA,
+                          portfolio_return = NA, cumulative_portfolio_return = NA, option_symbol = NA){
+  newrow <- tibble(date, asset_bought, option_price, option_return, tradedates, sellprice, buyprices, underlying_spot,
+                   underlying_return, indexportfolio_price, hedgeportfolio_price, portfolio_price, portfolio_return, cumulative_portfolio_return, option_symbol)
+  return(newrow)
+}
+
+
+
+
