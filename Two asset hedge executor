@@ -1,0 +1,311 @@
+library(tidyverse)
+library(lubridate)
+library(quantmod)
+library(rugarch)
+library(PerformanceAnalytics)
+library(tidyquant)
+library(zoo)
+library(magrittr)
+
+
+
+
+
+
+
+
+options(warn = -1) # hides warnings
+
+
+#monetization rules
+mone_growth_rule <- 3       #feed in !
+mone_time_rule <- 5         #feed in !
+
+# The Hedge Rate
+hedge_size <- 0.01 #feed in # hedge percent
+hedge_rate <- (hedge_size / (365/mone_time_rule))
+
+#prices
+moneyness <- 0.9
+portfolio_price <- 10000
+indexportfolio_price <- portfolio_price * (1 - hedge_rate)
+hedgeportfolio_price <- portfolio_price * hedge_rate   #feed in ! 
+
+#Inputs
+asset1 <- "SPY"               
+asset2 <- "SPY"
+tickers <- c(asset1, asset2)
+
+Required_moneyness <- 0.85 
+expiration <- "2021" # time period for option downloading
+rf <- 0.02        # risk free rate
+target_ttm <- 3  # target maturities of the hedge options in months
+Alpha <- 2      # pareto alpha
+price <- "Last" # column name from which an option price is taken (Ask, Bid, Last)
+type <- "put"   # option type (put)
+
+pareto_confirmation <- TRUE
+
+
+# correlations and volatilities 
+corr <- compute_correlation(tickers[1], tickers[2], timing = "MaxNativeCor")
+corr <- corr$`Native max correlation between assets`[1,2] %>% as.numeric()
+vol1 <- compute_timeframe(tickers[1])
+vol1 <- vol1$`Absolute Max Month`[1] %>% as.numeric()
+vol2 <- compute_timeframe(tickers[2])
+vol2 <- vol2$`Absolute Max Month`[1] %>% as.numeric()
+
+
+# alternatively rolling correlations and volatilities
+corr <- rol_cor(tickers[1], tickers[2])
+vol1 <- rol_vol(tickers[1])
+vol2 <- rol_vol(tickers[2])
+
+
+# if external option data input then use the following data structures 
+option_input <- vector(mode="list", length=2)
+option_input[[1]] <-  download_options("SPY", "Last")[1]
+option_input[[2]] <-  download_options("SPY", "Last")[1]
+
+underlying_input <- vector(length=2)
+underlying_input[1] <-  download_underlying("SPY")
+underlying_input[2] <-  download_underlying("SPY")
+
+
+# Customized option choosing function. If external inputs, replace option_input and underlying_input. 
+choose_hedge_options_live <- partial(choose_hedge_options, tickers = tickers, expiration = expiration, rf = rf,
+                                     target_ttm = target_ttm, price = price,
+                                     option_input = NULL, underlying_input = NULL, corr = corr, vol1 = vol1, vol2=vol2)
+
+
+# # # # #
+hedge_result <- choose_hedge_options_live()
+
+#choosing wheteher to use direct or indirect hedge
+optionpick <- asset1
+chosen <- choose_option_asset(optionpick = optionpick, hedge_result = hedge_result)
+
+optionsymbol <- chosen$optionsymbol
+ticker_daily <- chosen$ticker_daily
+optionpurchaseprice <- chosen$optionpurchaseprice
+last_purchase_date <- today()
+
+
+
+#Time series table of the option portfolio
+portfoliotable <- create_newrow(date = today()-1, tradedates = 1, buyprices = optionpurchaseprice)
+portfoliotable[nrow(portfoliotable), "asset_bought"] <- ticker_daily
+portfoliotable[nrow(portfoliotable), "underlying_spot"] <- chosen$spot
+portfoliotable[nrow(portfoliotable), "option_price"] <- optionpurchaseprice
+portfoliotable[nrow(portfoliotable), "indexportfolio_price"] <- indexportfolio_price
+portfoliotable[nrow(portfoliotable), "hedgeportfolio_price"] <- hedgeportfolio_price
+portfoliotable[nrow(portfoliotable), "portfolio_price"] <- portfolio_price
+portfoliotable[nrow(portfoliotable), "option_symbol"] <- optionsymbol
+
+
+
+
+
+
+
+#-----Perform daily... This begins from day 2 ---------------
+
+#portfoliotable <- remove_latest_row(portfoliotable)
+
+#here we just check the price of the current hedge option for monetizing test
+
+data_source <- "download"
+
+if (portfoliotable[nrow(portfoliotable), "date"] == today()){
+  ticker_daily <- portfoliotable[nrow(portfoliotable)-1, "asset_bought"] %>% as.character()
+  optionsymbol <- portfoliotable[nrow(portfoliotable)-1, "option_symbol"] %>% as.character()
+  last_purchase_date <- portfoliotable[-nrow(portfoliotable), ] %>% filter(tradedates == 1) %>% select(date) %>% as.numeric() %>% as.Date()
+  
+}
+  if (data_source == "external"){
+    optionprice <- option <-input %>% filter(Symbol == optionsymbol) %>% select(UQ(as.symbol(price))) %>% as.numeric()
+    
+  } else {
+    opt_data <- download_options(ticker = ticker_daily, price = price)
+    opt_data <-  opt_data$opt_data
+    
+    optionprice <- opt_data %>% filter(Symbol == optionsymbol) %>% select(UQ(as.symbol(price))) %>% as.numeric()
+  }
+
+
+
+
+
+
+#------------------------------------------------
+
+# tests whether monetization is needed or not 
+if (monetize(optionprice=optionprice , optionpurchaseprice=optionpurchaseprice, last_purchase_date=last_purchase_date,
+             mone_time_rule=mone_time_rule, mone_growth_rule=mone_growth_rule, current_date = today())) {
+  
+  
+  print("Time to monetize")
+  
+  
+  # RECORDING TRADES 
+  newrow <- create_newrow(sellprice = optionprice, tradedates = 1)
+  if (newrow$date != portfoliotable[nrow(portfoliotable), "date"]){
+    portfoliotable <- bind_rows(portfoliotable, newrow)
+    date_replace <- FALSE
+  } else {
+    print("This day already added")
+    portfoliotable[nrow(portfoliotable), ] <- newrow
+    date_replace <- TRUE
+  }
+  
+  portfoliotable[nrow(portfoliotable), "option_return"] <-  log(optionprice) -
+    log(portfoliotable[nrow(portfoliotable) - 1, "option_price"])
+  
+  # Choosing possible hedging options  
+  hedge_result <- choose_hedge_options_live()
+  
+  # extracting the selling price of underlying
+  if (date_replace == TRUE){
+    optionpick <- portfoliotable[nrow(portfoliotable)-1, "asset_bought"]
+  }
+  
+  if (optionpick == asset2){
+    underlying_sellprice <- hedge_result$Indirect_spot
+  } else {
+    underlying_sellprice <- hedge_result$Direct_spot
+  }
+
+  if (pareto_confirmation == TRUE){
+    # summarizing pareto results
+    hedge_pareto_pricing <-  compute_hedge_pareto_prices(hedge_result = hedge_result)
+    summarize_hedge_prices(hedge_result = hedge_result, hedge_pareto_pricing = hedge_pareto_pricing) %>% print()
+  }
+  
+  # choosing between direct and indirect hedge
+  pick <- readline(prompt = "Enter asset: ")
+  if (pick == "asset1"){
+    optionpick = asset1
+  } else if (pick == "asset2") {
+    optionpick = asset2
+  } else {
+    optionpick = "empty"}
+  
+  # extracting the parameters of hedge choice to update the portfoliotable  
+  chosen <- choose_option_asset(optionpick = optionpick, hedge_result = hedge_result)
+  
+  optionsymbol <- chosen$optionsymbol
+  ticker_daily <- chosen$ticker_daily
+  optionpurchaseprice <- chosen$optionpurchaseprice
+  underlying_price <- chosen$spot
+  last_purchase_date <- today()
+  
+  # updating the portfoliotable
+  portfoliotable[nrow(portfoliotable), "option_symbol"] <- optionsymbol
+  portfoliotable[nrow(portfoliotable), "asset_bought"] <- ticker_daily
+  portfoliotable[nrow(portfoliotable), "buyprices"] <- optionpurchaseprice
+  portfoliotable[nrow(portfoliotable), "underlying_spot"] <- underlying_price
+  portfoliotable[nrow(portfoliotable), "underlying_return"] <- log(underlying_sellprice) - log(portfoliotable[nrow(portfoliotable) - 1, "underlying_spot"])
+  portfoliotable[nrow(portfoliotable), "indexportfolio_price"] <- exp(portfoliotable[nrow(portfoliotable), "underlying_return"])*
+    portfoliotable[nrow(portfoliotable) - 1, "indexportfolio_price"]
+  
+  portfoliotable[nrow(portfoliotable), "option_price"] <- optionpurchaseprice
+  
+  portfoliotable[nrow(portfoliotable), "hedgeportfolio_price"] <- exp(portfoliotable[nrow(portfoliotable), "option_return"])*
+    portfoliotable[nrow(portfoliotable) - 1, "hedgeportfolio_price"]
+  
+  portfoliotable[nrow(portfoliotable), "portfolio_price"] <- portfoliotable[nrow(portfoliotable), "indexportfolio_price"] +
+    portfoliotable[nrow(portfoliotable), "hedgeportfolio_price"]
+  
+  portfoliotable[nrow(portfoliotable), "portfolio_return"] <- log(portfoliotable[nrow(portfoliotable), "portfolio_price"]) -
+       log(portfoliotable[nrow(portfoliotable) - 1, "portfolio_price"]) 
+  
+  portfoliotable[nrow(portfoliotable), "cumulative_portfolio_return"] <- log(portfoliotable[nrow(portfoliotable), "portfolio_price"]) -
+    log(portfoliotable[1, "portfolio_price"])
+  
+  # calculating what trading actions are needed to rebalance the portfolio
+  target_index_price <- as.numeric(portfoliotable[nrow(portfoliotable), "portfolio_price"] * (1 - hedge_rate))
+  target_hedge_price <- as.numeric(portfoliotable[nrow(portfoliotable), "portfolio_price"] * hedge_rate)
+  trade_index <- as.numeric(target_index_price - portfoliotable[nrow(portfoliotable), "indexportfolio_price"])
+  trade_hedge <- as.numeric(target_hedge_price - portfoliotable[nrow(portfoliotable), "hedgeportfolio_price"])
+  number_of_index <- trade_index / underlying_price #number of securities to be traded
+  number_of_options <- trade_hedge / optionpurchaseprice ###
+  
+  
+
+  
+  
+  # print outcomes
+  cat("Trade index", trade_index, fill = TRUE)
+  cat("Trade hedge", trade_hedge)
+  
+  
+  portfoliotable[nrow(portfoliotable), "indexportfolio_price"] <- portfoliotable[nrow(portfoliotable), "indexportfolio_price"] + trade_index
+  
+  portfoliotable[nrow(portfoliotable), "hedgeportfolio_price"] <- portfoliotable[nrow(portfoliotable), "hedgeportfolio_price"] + trade_hedge
+  
+  
+  
+  
+  
+  
+} else{
+  
+  print("No trading required")
+  
+  newrow <- create_newrow(asset_bought =as.character(portfoliotable[nrow(portfoliotable), "asset_bought"]), sellprice = NA, tradedates = 0)
+  if (newrow$date != portfoliotable[nrow(portfoliotable), "date"]){
+    portfoliotable <- bind_rows(portfoliotable, newrow)
+    date_replace <- FALSE
+  } else {
+    print("This day already added")
+    portfoliotable[nrow(portfoliotable), ] <- newrow
+    date_replace <- TRUE
+  }
+  
+  
+  S0 <- download_underlying(ticker = ticker_daily)
+  
+  portfoliotable[nrow(portfoliotable), "option_symbol"] <- portfoliotable[nrow(portfoliotable)-1, "option_symbol"]
+  
+  portfoliotable[nrow(portfoliotable), "underlying_spot"] <- S0
+  portfoliotable[nrow(portfoliotable), "underlying_return"] <- log(S0) - as.numeric(log(portfoliotable[nrow(portfoliotable) - 1, "underlying_spot"]))
+  portfoliotable[nrow(portfoliotable), "indexportfolio_price"] <- portfoliotable[nrow(portfoliotable) - 1, "indexportfolio_price"] * 
+    exp(portfoliotable[nrow(portfoliotable), "underlying_return"])
+  
+  portfoliotable[nrow(portfoliotable), "option_price"] <- optionprice
+  portfoliotable[nrow(portfoliotable), "option_return"] <- log(optionprice) -
+    log(portfoliotable[nrow(portfoliotable) - 1, "option_price"])
+  portfoliotable[nrow(portfoliotable), "hedgeportfolio_price"] <- portfoliotable[nrow(portfoliotable) - 1, "hedgeportfolio_price"] *
+    exp(portfoliotable[nrow(portfoliotable), "option_return"])
+  
+  
+  portfoliotable[nrow(portfoliotable), "portfolio_price"] <- as.numeric(portfoliotable[nrow(portfoliotable), "indexportfolio_price"]) +
+    as.numeric(portfoliotable[nrow(portfoliotable), "hedgeportfolio_price"])
+  
+  portfoliotable[nrow(portfoliotable), "portfolio_return"] <- log(portfoliotable[nrow(portfoliotable), "portfolio_price"]) -
+    log(portfoliotable[nrow(portfoliotable) - 1, "portfolio_price"]) 
+  
+  portfoliotable[nrow(portfoliotable), "cumulative_portfolio_return"] <- log(portfoliotable[nrow(portfoliotable), "portfolio_price"]) -
+    log(as.numeric(portfoliotable[1, "portfolio_price"]))
+  
+  
+}
+
+####################################################################################################
+###################################################################################################3
+
+#save a portfoliotable started at a certain date
+write.csv(portfoliotable, file =paste("portfoliotable_from_",portfoliotable[1, 1],".csv"))
+
+# add here everything wanted to be saved
+
+
+# evaluate thr match of indirect hedge 
+print(hedge_result$Strike_diff)
+print(hedge_result$Date_diff)
+
+View(portfoliotable)
+
+
+
+
