@@ -1,0 +1,39 @@
+
+
+library(PerformanceAnalytics)
+library(quantmod)
+
+#weightings of index and hedge
+weight_index <- 0.99
+weight_hedge <- 0.01
+
+
+# log returns of index and hedge
+ret_data <- data.frame(ret_index, ret_hedge)
+
+
+
+#Extracting rebalancing (trading) dates 
+rebalancing_dates <- portfoliotable %>% filter(tradedates == "Yes") 
+rebalancing_time <- rebalancing_dates$time_period
+rebalancing_weight <- data.frame(rep(weight_index, length(rebalancing_time)), rep(weight_hedge, length(rebalancing_time))) %>% as.matrix()
+rebalancing_data <- xts(rebalancing_weight, order.by = rebalancing_time)
+
+
+
+# daily returns of the hedged portfolio
+port_ret <- Return.portfolio(exp(ret_data), rebalancing_data)
+
+# cumulative returns of the hedged portfolio
+total_ret <- cumprod(port_ret)
+tail(total_ret, n=1)
+
+
+
+# t test 
+r_ret <- coredata(port_ret) %>% as.vector()
+t.test(r_ret, ret_index)
+
+
+
+
