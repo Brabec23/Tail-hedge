@@ -1,0 +1,41 @@
+
+library(tidyverse)
+library(tidyquant)
+library(zoo)
+Sys.setlocale("LC_TIME", "English")
+
+
+
+#Inputs
+asset1 <- #feed in asset               
+asset2 <- # feed in asset
+tickers <- c(asset1, asset2)
+
+Required_moneyness <- 0.75 
+expiration <- "2020" # time period for option downloading
+rf <- 0.02        # risk free rate
+target_ttm <- 3  # target maturities of the hedge options in months
+Alpha <- 2      # pareto alpha
+price <- "Last" # column name from which an option price is taken (Ask, Bid, Last)
+type <- "put"   # option type (put)
+
+
+
+# correlations and volatilities 
+corr <- compute_correlation(tickers[1], tickers[2], timing = "MaxNativeCor")
+corr <- corr$`Native max correlation between assets`[1,2] %>% as.numeric()
+vol1 <- compute_timeframe(tickers[1])
+vol1 <- vol1$`Absolute Max Month`[1] %>% as.numeric()
+vol2 <- compute_timeframe(tickers[2])
+vol2 <- vol2$`Absolute Max Month`[1] %>% as.numeric()
+
+
+
+hedge_result <- choose_hedge_options(asset1 = asset1, asset2 = asset2, expiration = expiration, rf = rf,
+                                     target_ttm = target_ttm, price = price, corr = corr, vol1 = vol1, vol2=vol2)
+hedge_dates <- c(hedge_result$Direct_hedge_date, hedge_result$Indirect_hedge_date)
+hedge_strikes <- c(hedge_result$directStrike, hedge_result$indirectStrike)
+option_symbols <- c(hedge_result$Direct_symbol, hedge_result$Indirect_symbol)
+
+hedge_pareto_pricing <-  compute_hedge_pareto_prices(hedge_result = hedge_result)
+summarize_hedge_prices(hedge_result = hedge_result, hedge_pareto_pricing = hedge_pareto_pricing)
